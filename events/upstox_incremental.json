@@ -1,0 +1,6 @@
+{
+  "source": "upstox",
+  "entity": "equity_ohlcv",
+  "instrument_key": "NSE_EQ|INE002A01018",
+  "overlap_days": 3
+}

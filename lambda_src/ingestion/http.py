@@ -92,6 +92,49 @@ class HttpClient:
 
         raise SourceAPIError(f"Request exhausted retries; url={self._safe_url(url)}")
 
+
+    def get_bytes(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        before_attempt: Callable[[], None] | None = None,
+    ) -> bytes:
+        """Fetch a binary resource (for example Upstox's gzip instrument master)."""
+        request_headers = {"Accept": "application/octet-stream, application/json", "User-Agent": self.user_agent}
+        if headers:
+            request_headers.update(headers)
+        for attempt in range(self.max_retries + 1):
+            if before_attempt is not None:
+                before_attempt()
+            request = urllib.request.Request(url, headers=request_headers, method="GET")
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    return response.read()
+            except urllib.error.HTTPError as exc:
+                body = exc.read(1024).decode("utf-8", errors="replace")
+                if exc.code in RETRYABLE_STATUS_CODES and attempt < self.max_retries:
+                    delay = self._retry_delay(attempt, exc.headers.get("Retry-After"))
+                    LOGGER.warning("Retryable binary HTTP response status=%s attempt=%s delay_seconds=%.2f url=%s",
+                                   exc.code, attempt + 1, delay, self._safe_url(url))
+                    time.sleep(delay)
+                    continue
+                raise SourceAPIError(
+                    f"Provider binary request failed with HTTP {exc.code}; url={self._safe_url(url)}; "
+                    f"response_excerpt={body[:300]}"
+                ) from exc
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                if attempt < self.max_retries:
+                    delay = self._retry_delay(attempt, None)
+                    LOGGER.warning("Transient binary network failure attempt=%s delay_seconds=%.2f url=%s error=%s",
+                                   attempt + 1, delay, self._safe_url(url), type(exc).__name__)
+                    time.sleep(delay)
+                    continue
+                raise SourceAPIError(
+                    f"Binary request failed after {self.max_retries + 1} attempts; "
+                    f"url={self._safe_url(url)}; error={type(exc).__name__}"
+                ) from exc
+        raise SourceAPIError(f"Binary request exhausted retries; url={self._safe_url(url)}")
+
     @staticmethod
     def build_url(base_url: str, path: str = "", query: dict[str, Any] | None = None) -> str:
         url = base_url.rstrip("/") + ("/" + path.lstrip("/") if path else "")

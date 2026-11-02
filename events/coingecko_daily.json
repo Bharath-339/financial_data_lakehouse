@@ -1,0 +1,8 @@
+{
+  "source": "coingecko",
+  "entity": "market_snapshot",
+  "vs_currency": "inr",
+  "order": "market_cap_desc",
+  "per_page": 50,
+  "page": 1
+}

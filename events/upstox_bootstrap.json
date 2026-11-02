@@ -1,0 +1,8 @@
+{
+  "source": "upstox",
+  "entity": "equity_ohlcv",
+  "instrument_key": "NSE_EQ|INE002A01018",
+  "start_date": "2025-01-01",
+  "end_date": "2026-10-30",
+  "advance_watermark": true
+}

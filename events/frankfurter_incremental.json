@@ -1,0 +1,7 @@
+{
+  "source": "frankfurter",
+  "entity": "daily_rates",
+  "base": "USD",
+  "quotes": ["INR", "EUR", "GBP"],
+  "overlap_days": 3
+}

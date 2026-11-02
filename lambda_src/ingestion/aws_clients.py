@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from .errors import ConcurrentInvocationError, ConfigurationError
@@ -20,9 +21,13 @@ LOGGER = logging.getLogger(__name__)
 class AwsClients:
     def __init__(self):
         region = os.environ.get("AWS_REGION")
-        self.s3 = boto3.client("s3", region_name=region)
-        self.secrets = boto3.client("secretsmanager", region_name=region)
-        self.dynamodb = boto3.resource("dynamodb", region_name=region)
+        # Floci/local AWS emulators expose one AWS-compatible endpoint. In AWS this
+        # remains unset and boto3 uses the normal regional service endpoints.
+        endpoint_url = os.environ.get("AWS_ENDPOINT_URL") or None
+        s3_config = Config(s3={"addressing_style": "path"}) if endpoint_url else None
+        self.s3 = boto3.client("s3", region_name=region, endpoint_url=endpoint_url, config=s3_config)
+        self.secrets = boto3.client("secretsmanager", region_name=region, endpoint_url=endpoint_url)
+        self.dynamodb = boto3.resource("dynamodb", region_name=region, endpoint_url=endpoint_url)
         table_name = os.environ.get("STATE_TABLE")
         bucket_name = os.environ.get("RAW_BUCKET")
         if not table_name or not bucket_name:

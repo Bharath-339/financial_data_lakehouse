@@ -1,0 +1,2 @@
+# Install these into the Airflow environment separately from the Spark runtime.
+apache-airflow-providers-amazon>=9.0,<10

@@ -1,0 +1,4 @@
+instrument_key,symbol,company_name,exchange,isin,sector,asset_type
+NSE_EQ|INE002A01018,RELIANCE,Reliance Industries Limited,NSE,INE002A01018,Energy,EQUITY
+NSE_EQ|INE467B01029,TCS,Tata Consultancy Services Limited,NSE,INE467B01029,Information Technology,EQUITY
+NSE_EQ|INE009A01021,INFY,Infosys Limited,NSE,INE009A01021,Information Technology,EQUITY

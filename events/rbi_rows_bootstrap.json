@@ -1,0 +1,15 @@
+{
+  "source": "rbi",
+  "entity": "table_rows",
+  "schema": "financial_sector",
+  "table": "bmc_m_rn",
+  "start_date": "2024-04-01",
+  "end_date": "2026-10-30",
+  "advance_watermark": true,
+  "page_size": 500,
+  "max_pages": 20,
+  "include_labels": true,
+  "filters": {
+    "comp_rn": "CMS1101"
+  }
+}

@@ -1,0 +1,311 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Financial Data Lakehouse API ingestion worker. Airflow (or a manual caller)
+  invokes one Lambda execution per source/entity/instrument extraction unit.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: financial-lakehouse
+    AllowedPattern: '^[a-zA-Z0-9-]{3,30}$'
+    Description: Short project identifier used in resource names and tags.
+
+  ArtifactBucket:
+    Type: String
+    Description: Existing S3 bucket in this same AWS Region containing the Lambda ZIP.
+
+  ArtifactKey:
+    Type: String
+    Default: financial-lakehouse-ingestion/lambda.zip
+    Description: S3 key of the Lambda deployment ZIP.
+
+  AwsEndpointUrl:
+    Type: String
+    Default: ''
+    Description: Optional AWS-compatible endpoint for local Floci development. Leave empty in AWS.
+
+  EnforceSecureTransportDeny:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Deny non-TLS S3 requests in AWS; set false for local HTTP-only Floci development.
+
+  PythonRuntime:
+    Type: String
+    Default: python3.13
+    AllowedValues:
+      - python3.13
+      - python3.12
+    Description: Managed Lambda Python runtime.
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+    Description: Maximum execution time in seconds. Lambda supports up to 900 seconds.
+
+  LambdaMemory:
+    Type: Number
+    Default: 1024
+    AllowedValues: [256, 512, 1024, 1536, 2048]
+
+  ReservedConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 50
+    Description: Caps concurrent extraction invocations and helps protect provider quotas.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+
+Conditions:
+  CreateSecureTransportPolicy: !Equals [!Ref EnforceSecureTransportDeny, 'true']
+
+Resources:
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Layer
+          Value: Bronze
+
+  RawDataBucketPolicy:
+    Condition: CreateSecureTransportPolicy
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RawDataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt RawDataBucket.Arn
+              - !Sub '${RawDataBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  IngestionStateTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  UpstoxTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: JSON secret containing the Upstox OAuth access_token.
+      SecretString: '{}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  CoinGeckoApiSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: JSON secret containing the optional CoinGecko Demo api_key.
+      SecretString: '{}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  IngestionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-ingestion'
+      RetentionInDays: !Ref LogRetentionDays
+
+  IngestionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: FinancialLakehouseIngestionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteBronzeObjects
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${RawDataBucket.Arn}/bronze/*'
+                  - !Sub '${RawDataBucket.Arn}/audit/*'
+              - Sid: ManageIngestionCheckpoints
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt IngestionStateTable.Arn
+              - Sid: ReadProviderSecrets
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref UpstoxTokenSecret
+                  - !Ref CoinGeckoApiSecret
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: FinancialLakehouseDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListLakehouseBucket
+                Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation, s3:ListBucketMultipartUploads]
+                Resource: !GetAtt RawDataBucket.Arn
+              - Sid: ReadBronzeAndReference
+                Effect: Allow
+                Action: [s3:GetObject]
+                Resource:
+                  - !Sub '${RawDataBucket.Arn}/bronze/*'
+                  - !Sub '${RawDataBucket.Arn}/reference/*'
+                  - !Sub '${RawDataBucket.Arn}/warehouse/*'
+              - Sid: WriteLakehouseLayers
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:DeleteObject, s3:AbortMultipartUpload, s3:ListMultipartUploadParts]
+                Resource:
+                  - !Sub '${RawDataBucket.Arn}/silver/*'
+                  - !Sub '${RawDataBucket.Arn}/gold/*'
+                  - !Sub '${RawDataBucket.Arn}/quarantine/*'
+                  - !Sub '${RawDataBucket.Arn}/audit/*'
+                  - !Sub '${RawDataBucket.Arn}/warehouse/*'
+              - Sid: ManageGlueCatalog
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:CreateDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                  - glue:CreatePartition
+                  - glue:BatchCreatePartition
+                  - glue:UpdatePartition
+                  - glue:DeletePartition
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  IngestionFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - IngestionLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ingestion'
+      Description: Reusable external financial API ingestion worker to S3 Bronze.
+      Runtime: !Ref PythonRuntime
+      Handler: handler.lambda_handler
+      Role: !GetAtt IngestionExecutionRole.Arn
+      Architectures:
+        - arm64
+      MemorySize: !Ref LambdaMemory
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      EphemeralStorage:
+        Size: 512
+      Environment:
+        Variables:
+          RAW_BUCKET: !Ref RawDataBucket
+          STATE_TABLE: !Ref IngestionStateTable
+          AWS_ENDPOINT_URL: !Ref AwsEndpointUrl
+          UPSTOX_SECRET_ARN: !Ref UpstoxTokenSecret
+          COINGECKO_SECRET_ARN: !Ref CoinGeckoApiSecret
+          HTTP_TIMEOUT_SECONDS: '20'
+          HTTP_MAX_RETRIES: '4'
+          DEFAULT_OVERLAP_DAYS: '3'
+          LOG_LEVEL: INFO
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: Ingestion
+
+Outputs:
+  IngestionFunctionName:
+    Description: Lambda function name. Invoke it with one source/entity event.
+    Value: !Ref IngestionFunction
+  IngestionFunctionArn:
+    Description: Grant this ARN to the Airflow execution role for lambda:InvokeFunction.
+    Value: !GetAtt IngestionFunction.Arn
+  RawDataBucketName:
+    Value: !Ref RawDataBucket
+  IngestionStateTableName:
+    Value: !Ref IngestionStateTable
+  UpstoxTokenSecretArn:
+    Value: !Ref UpstoxTokenSecret
+  CoinGeckoApiSecretArn:
+    Value: !Ref CoinGeckoApiSecret
+  GlueJobRoleArn:
+    Description: Execution role for the production AWS Glue Spark jobs.
+    Value: !GetAtt GlueJobRole.Arn

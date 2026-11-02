@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import hashlib
+import gzip
 import json
 import os
 import time
@@ -71,13 +72,18 @@ def resolve_date_range(event: dict[str, Any], state: dict[str, Any]) -> tuple[da
         advance = bool(event.get("advance_watermark", False))
     else:
         watermark = state.get("last_successful_date")
-        if not watermark:
+        if not watermark and event.get("bootstrap_start_date"):
+            # A recurring DAG can carry this optional value: it is used only for the
+            # first run, then the checkpoint takes over for incremental extraction.
+            start = parse_date(event["bootstrap_start_date"], "bootstrap_start_date")
+            advance = bool(event.get("advance_watermark", True))
+        elif not watermark:
             raise ConfigurationError(
-                "No checkpoint exists. First run must provide start_date and end_date; "
-                "set advance_watermark=true after choosing a complete bootstrap range."
+                "No checkpoint exists. First run must provide start_date/end_date or bootstrap_start_date."
             )
-        start = parse_date(watermark, "last_successful_date") - timedelta(days=overlap_days)
-        advance = True
+        else:
+            start = parse_date(watermark, "last_successful_date") - timedelta(days=overlap_days)
+            advance = True
 
     if start > end:
         raise ConfigurationError(f"start_date {start} must not be after end_date {end}")
@@ -213,6 +219,48 @@ def _extract_upstox(event: dict[str, Any], runtime: IngestionRuntime, run_id: st
     return {"record_count": total_records, "object_keys": objects,
             "start_date": start.isoformat(), "end_date": end.isoformat(), "advance_watermark": advance}
 
+
+
+def _extract_upstox_instrument_master(event: dict[str, Any], runtime: IngestionRuntime,
+                                     run_id: str, extract_date: str) -> dict[str, Any]:
+    """Land the public daily BOD instrument master as one immutable Bronze snapshot."""
+    url = str(event.get(
+        "url",
+        "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz",
+    ))
+    if not url.startswith("https://assets.upstox.com/"):
+        raise ConfigurationError("Upstox instrument master URL must use the official assets.upstox.com host")
+    raw = runtime.http.get_bytes(
+        url,
+        before_attempt=lambda: _throttle(runtime, "upstox"),
+    )
+    try:
+        decoded = gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw
+        payload = json.loads(decoded.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SourceAPIError("Upstox instrument master was not a valid JSON or gzip JSON document") from exc
+    if isinstance(payload, dict):
+        # Some feeds wrap the array in a data/instruments object. Keep the wrapper
+        # shape intact for auditability but require a discoverable instrument array.
+        candidates = [payload.get("data"), payload.get("instruments"), payload.get("records")]
+        records = next((candidate for candidate in candidates if isinstance(candidate, list)), None)
+    else:
+        records = payload
+    if not isinstance(records, list) or not records:
+        raise SourceAPIError("Upstox instrument master contained no instrument records")
+    valid = [row for row in records if isinstance(row, dict) and row.get("instrument_key")]
+    if not valid:
+        raise SourceAPIError("Upstox instrument master contained no records with instrument_key")
+    key, compressed_size = _write(
+        runtime, source="upstox", entity="instrument_master", entity_key="complete",
+        run_id=run_id, extract_date=extract_date, page_number=1,
+        request_metadata={"url": url, "feed": "BOD complete JSON",
+                          "record_count": len(records), "valid_instrument_count": len(valid)},
+        payload=payload,
+    )
+    return {"record_count": len(valid), "object_keys": [key],
+            "compressed_bytes": compressed_size, "master_date": extract_date,
+            "advance_watermark": False}
 
 def _extract_coingecko(event: dict[str, Any], runtime: IngestionRuntime, run_id: str,
                        extract_date: str) -> dict[str, Any]:
@@ -366,6 +414,8 @@ def dispatch(event: dict[str, Any], runtime: IngestionRuntime, run_id: str, extr
     entity = str(event.get("entity", "")).lower()
     if source == "upstox" and entity == "equity_ohlcv":
         return _extract_upstox(event, runtime, run_id, extract_date, state)
+    if source == "upstox" and entity == "instrument_master":
+        return _extract_upstox_instrument_master(event, runtime, run_id, extract_date)
     if source == "coingecko" and entity == "market_snapshot":
         return _extract_coingecko(event, runtime, run_id, extract_date)
     if source == "frankfurter" and entity == "daily_rates":
@@ -376,7 +426,7 @@ def dispatch(event: dict[str, Any], runtime: IngestionRuntime, run_id: str, extr
         return _extract_rbi_rows(event, runtime, run_id, extract_date, state)
     raise ConfigurationError(
         "Unsupported source/entity. Supported: upstox/equity_ohlcv, "
-        "coingecko/market_snapshot, frankfurter/daily_rates, "
+        "upstox/instrument_master, coingecko/market_snapshot, frankfurter/daily_rates, "
         "rbi/table_catalogue, rbi/table_rows"
     )
 
@@ -384,10 +434,12 @@ def dispatch(event: dict[str, Any], runtime: IngestionRuntime, run_id: str, extr
 def checkpoint_key(event: dict[str, Any]) -> str:
     source = str(event.get("source", "")).upper()
     entity = str(event.get("entity", "")).upper()
-    if source == "UPSTOX":
+    if source == "UPSTOX" and entity == "EQUITY_OHLCV":
         identifier = event.get("instrument_key")
         if not identifier:
-            raise ConfigurationError("Upstox requires instrument_key")
+            raise ConfigurationError("Upstox equity_ohlcv requires instrument_key")
+    elif source == "UPSTOX" and entity == "INSTRUMENT_MASTER":
+        identifier = "complete"
     elif source == "COINGECKO":
         identifier = str(event.get("vs_currency", "inr")).upper()
     elif source == "FRANKFURTER":
